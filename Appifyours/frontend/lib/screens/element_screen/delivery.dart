@@ -27,8 +27,8 @@ class ShiprocketConfig {
   // 👇 API USER credentials (NOT your main Shiprocket login)
   // Create API User in Shiprocket → Settings → API → Configure
   // Use a DIFFERENT email than your main account
-  static const String email    = 'dhavakumar870@gmail.com';
-  static const String password = '9!wgMrjyNugCUo04oYlu5aBYmKa#47hV';
+  static const String email    = 'jbbsoftech@gmail.com';
+  static const String password = '$0HH5PgopfQGCym%9TtUHxSzp01$2uKj';
 
   // Go to Shiprocket → Settings → Manage Pickup Addresses
   // Copy the EXACT "Pickup Location Name" from there
