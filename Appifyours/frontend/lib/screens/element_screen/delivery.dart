@@ -50,77 +50,59 @@ class ShiprocketConfig {
 class ShiprocketService {
   final ApiService _apiService = ApiService();
 
-  // Helper to make authenticated requests to backend proxy with retry logic
+  // Helper to make authenticated requests to backend proxy
   Future<Map<String, dynamic>> _proxyRequest(
     String method,
     String endpoint,
     Map<String, dynamic>? body,
   ) async {
-    // Retry logic with exponential backoff
-    for (int attempt = 0; attempt < 3; attempt++) {
-      try {
-        final token = await _apiService._getToken();
-        if (token == null) {
-          throw Exception('No authentication token found');
-        }
-
-        final url = Uri.parse('${ShiprocketConfig.baseUrl}/api/shiprocket$endpoint');
-        debugPrint('📤 SR Proxy: $method $url (attempt ${attempt + 1}/3)');
-
-        late http.Response response;
-        final timeout = Platform.isAndroid || Platform.isIOS 
-            ? const Duration(seconds: 60) 
-            : const Duration(seconds: 45);
-            
-        if (method == 'POST') {
-          response = await http.post(
-            url,
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': 'Bearer $token',
-            },
-            body: json.encode(body),
-          ).timeout(timeout);
-        } else if (method == 'GET') {
-          response = await http.get(
-            url,
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': 'Bearer $token',
-            },
-          ).timeout(timeout);
-        } else {
-          throw Exception('Unsupported method: $method');
-        }
-
-        debugPrint('📥 SR Proxy Response: ${response.statusCode}');
-        
-        final data = json.decode(response.body);
-        if (response.statusCode >= 200 && response.statusCode < 300) {
-          return data;
-        } else {
-          // Don't retry on client errors (4xx)
-          if (response.statusCode >= 400 && response.statusCode < 500) {
-            throw Exception(data['error'] ?? 'Request failed');
-          }
-          throw Exception(data['error'] ?? 'Request failed');
-        }
-      } catch (e) {
-        debugPrint('❌ SR Proxy error (attempt ${attempt + 1}/3): $e');
-        
-        // Don't retry on the last attempt
-        if (attempt == 2) {
-          rethrow;
-        }
-        
-        // Exponential backoff
-        final backoffDelay = Duration(milliseconds: 1000 * (1 << attempt));
-        debugPrint('⏳ Retrying after ${backoffDelay.inSeconds}s...');
-        await Future.delayed(backoffDelay);
+    try {
+      final token = await _apiService._getToken();
+      if (token == null) {
+        throw Exception('No authentication token found');
       }
+
+      final url = Uri.parse('${ShiprocketConfig.baseUrl}/api/shiprocket$endpoint');
+      debugPrint('📤 SR Proxy: $method $url');
+
+      late http.Response response;
+      final timeout = Platform.isAndroid || Platform.isIOS 
+          ? const Duration(seconds: 60) 
+          : const Duration(seconds: 30);
+          
+      if (method == 'POST') {
+        response = await http.post(
+          url,
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $token',
+          },
+          body: json.encode(body),
+        ).timeout(timeout);
+      } else if (method == 'GET') {
+        response = await http.get(
+          url,
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $token',
+          },
+        ).timeout(timeout);
+      } else {
+        throw Exception('Unsupported method: $method');
+      }
+
+      debugPrint('📥 SR Proxy Response: ${response.statusCode}');
+      
+      final data = json.decode(response.body);
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        return data;
+      } else {
+        throw Exception(data['error'] ?? 'Request failed');
+      }
+    } catch (e) {
+      debugPrint('❌ SR Proxy error: $e');
+      rethrow;
     }
-    
-    throw Exception('Max retries exceeded');
   }
 
   // ── CHECK PINCODE ────────────────────────────────────────────
