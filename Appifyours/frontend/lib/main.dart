@@ -8790,7 +8790,7 @@ class AdminManager {
 
 
 
-        Uri.parse('http://192.168.0.11:5000/api/admin/app-info'),
+        Uri.parse('http://192.168.0.10:5000/api/admin/app-info'),
 
 
 
@@ -11590,7 +11590,7 @@ class _SignInPageState extends State<SignInPage> {
 
 
 
-        Uri.parse('http://192.168.0.11:5000/api/login'),
+        Uri.parse('http://192.168.0.10:5000/api/login'),
 
 
 
