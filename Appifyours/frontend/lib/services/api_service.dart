@@ -9,6 +9,7 @@ import 'package:http_parser/http_parser.dart'; // For MediaType
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'dart:async'; // For StreamController
+import 'dart:io'; // For Platform
 
 class GroqResponse {
   final bool success;
@@ -46,25 +47,72 @@ class ApiService {
 
   String _resolveBaseUrl() {
     final configured = (dotenv.env['API_BASE'] ?? '').trim();
-    const fallback = 'http://127.0.0.1:5000';
-    final raw = configured.isEmpty ? fallback : configured;
+    
+    // CRITICAL: No fallback to localhost - must use configured value
+    if (configured.isEmpty) {
+      throw Exception(
+        'API_BASE environment variable is not set. '
+        'Please configure it in your .env file. '
+        'For production, use your actual backend server URL.'
+      );
+    }
 
+    final raw = configured;
+
+    // On web, convert localhost to 127.0.0.1 for consistency
     if (kIsWeb && raw.contains('localhost')) {
       return raw.replaceFirst('localhost', '127.0.0.1');
     }
 
+    return raw;
+  }
+
+  // Platform-specific timeout configuration
+  Duration get _defaultTimeout {
     if (kIsWeb) {
-      final host = Uri.base.host;
-      if (host == 'localhost' || host == '127.0.0.1') {
-        final uri = Uri.tryParse(raw);
-        final configuredHost = uri?.host ?? '';
-        if (configuredHost.isNotEmpty && configuredHost != host) {
-          return fallback;
+      return const Duration(seconds: 30); // Web: faster, more reliable
+    } else if (Platform.isAndroid) {
+      return const Duration(seconds: 45); // Android: mobile networks can be slower
+    } else if (Platform.isIOS) {
+      return const Duration(seconds: 45); // iOS: mobile networks can be slower
+    } else {
+      return const Duration(seconds: 30); // Default
+    }
+  }
+
+  // Retry logic with exponential backoff
+  Future<http.Response> _retryWithBackoff(
+    Future<http.Response> Function() requestFn, {
+    int maxRetries = 3,
+    Duration? baseDelay,
+  }) async {
+    final delay = baseDelay ?? const Duration(milliseconds: 1000);
+    
+    for (int attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        return await requestFn().timeout(_defaultTimeout);
+      } catch (e) {
+        // Don't retry on client errors (4xx)
+        if (e is http.ClientException && e.toString().contains('401')) {
+          rethrow;
         }
+        
+        // Don't retry on the last attempt
+        if (attempt == maxRetries - 1) {
+          rethrow;
+        }
+        
+        // Exponential backoff
+        final backoffDelay = Duration(
+          milliseconds: delay.inMilliseconds * (1 << attempt),
+        );
+        
+        print('⚠️  Retry attempt ${attempt + 1}/$maxRetries after ${backoffDelay.inSeconds}s');
+        await Future.delayed(backoffDelay);
       }
     }
-
-    return raw;
+    
+    throw Exception('Max retries exceeded');
   }
   
   // Real-time WebSocket connection
@@ -246,7 +294,7 @@ class ApiService {
     }
   }
 
-  // Generic GET request with token
+  // Generic GET request with token and retry logic
   Future<http.Response> get(String endpoint) async {
     final token = await _getToken();
 
@@ -254,22 +302,24 @@ class ApiService {
       throw Exception('No authentication token found');
     }
 
-    final response = await http.get(
-      Uri.parse('$baseUrl$endpoint'),
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer $token',
-      },
-    );
+    return await _retryWithBackoff(() async {
+      final response = await http.get(
+        Uri.parse('$baseUrl$endpoint'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $token',
+        },
+      );
 
-    if (response.statusCode == 401) {
-      throw Exception('Token expired or invalid');
-    }
+      if (response.statusCode == 401) {
+        throw Exception('Token expired or invalid');
+      }
 
-    return response;
+      return response;
+    });
   }
 
-  // Generic POST request with token
+  // Generic POST request with token and retry logic
   Future<http.Response> post(String endpoint, Map<String, dynamic> body) async {
     final token = await _getToken();
 
@@ -277,58 +327,8 @@ class ApiService {
       throw Exception('No authentication token found');
     }
 
-    final response = await http.post(
-      Uri.parse('$baseUrl$endpoint'),
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer $token',
-      },
-      body: jsonEncode(body),
-    );
-
-    if (response.statusCode == 401) {
-      throw Exception('Token expired or invalid');
-    }
-
-    return response;
-  }
-
-  // Generic PUT request with token
-  Future<http.Response> put(String endpoint, Map<String, dynamic> body) async {
-    final token = await _getToken();
-
-    if (token == null) {
-      throw Exception('No authentication token found');
-    }
-
-    final response = await http.put(
-      Uri.parse('$baseUrl$endpoint'),
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer $token',
-      },
-      body: jsonEncode(body),
-    );
-
-    if (response.statusCode == 401) {
-      throw Exception('Token expired or invalid');
-    }
-
-    return response;
-  }
-
-  // Generic DELETE request with token and optional body
-  Future<http.Response> delete(String endpoint, [Map<String, dynamic>? body]) async {
-    final token = await _getToken();
-
-    if (token == null) {
-      throw Exception('No authentication token found');
-    }
-
-    http.Response response;
-    
-    if (body != null) {
-      response = await http.delete(
+    return await _retryWithBackoff(() async {
+      final response = await http.post(
         Uri.parse('$baseUrl$endpoint'),
         headers: {
           'Content-Type': 'application/json',
@@ -336,32 +336,102 @@ class ApiService {
         },
         body: jsonEncode(body),
       );
-    } else {
-      response = await http.delete(
+
+      if (response.statusCode == 401) {
+        throw Exception('Token expired or invalid');
+      }
+
+      return response;
+    });
+  }
+
+  // Generic PUT request with token and retry logic
+  Future<http.Response> put(String endpoint, Map<String, dynamic> body) async {
+    final token = await _getToken();
+
+    if (token == null) {
+      throw Exception('No authentication token found');
+    }
+
+    return await _retryWithBackoff(() async {
+      final response = await http.put(
         Uri.parse('$baseUrl$endpoint'),
         headers: {
           'Content-Type': 'application/json',
           'Authorization': 'Bearer $token',
         },
+        body: jsonEncode(body),
       );
-    }
 
-    if (response.statusCode == 401) {
-      throw Exception('Token expired or invalid');
-    }
+      if (response.statusCode == 401) {
+        throw Exception('Token expired or invalid');
+      }
 
-    return response;
+      return response;
+    });
   }
 
-  // POST without token (for login, register, etc.)
+  // Generic DELETE request with token and optional body with retry logic
+  Future<http.Response> delete(String endpoint, [Map<String, dynamic>? body]) async {
+    final token = await _getToken();
+
+    if (token == null) {
+      throw Exception('No authentication token found');
+    }
+
+    return await _retryWithBackoff(() async {
+      http.Response response;
+      
+      if (body != null) {
+        response = await http.delete(
+          Uri.parse('$baseUrl$endpoint'),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $token',
+          },
+          body: jsonEncode(body),
+        );
+      } else {
+        response = await http.delete(
+          Uri.parse('$baseUrl$endpoint'),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $token',
+          },
+        );
+      }
+
+      if (response.statusCode == 401) {
+        throw Exception('Token expired or invalid');
+      }
+
+      return response;
+    });
+  }
+
+  // POST without token (for login, register, etc.) with retry logic
   Future<http.Response> postWithoutAuth(String endpoint, Map<String, dynamic> body) async {
-    return await http.post(
-      Uri.parse('$baseUrl$endpoint'),
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: jsonEncode(body),
-    );
+    return await _retryWithBackoff(() async {
+      return await http.post(
+        Uri.parse('$baseUrl$endpoint'),
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode(body),
+      );
+    });
+  }
+
+  // GET without token with retry logic
+  Future<http.Response> getWithoutAuth(String endpoint) async {
+    return await _retryWithBackoff(() async {
+      return await http.get(
+        Uri.parse('$baseUrl$endpoint'),
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      );
+    });
   }
 
   // Get JSON response directly
@@ -599,15 +669,6 @@ class ApiService {
       print('Error creating shop: $e');
       throw Exception('Failed to create shop: $e');
     }
-  }
-
-  Future<http.Response> getWithoutAuth(String endpoint) async {
-    return await http.get(
-      Uri.parse('$baseUrl$endpoint'),
-      headers: {
-        'Content-Type': 'application/json',
-      },
-    );
   }
 
   Future<List<Map<String, dynamic>>> getUserSubscriptions() async {
@@ -1086,8 +1147,22 @@ class ApiService {
   
   // ===== NEW METHODS FOR DYNAMIC FEATURES =====
 
-  // Get app name for splash screen
+  // Get app name for splash screen with caching and retry logic
   Future<Map<String, dynamic>> getAppName({String? adminId}) async {
+    final prefs = await SharedPreferences.getInstance();
+    
+    // Check cache first (5 minute cache)
+    final cachedAppName = prefs.getString('cached_app_name');
+    final cacheTime = prefs.getInt('cached_app_name_time');
+    
+    if (cachedAppName != null && cacheTime != null) {
+      final cacheAge = DateTime.now().millisecondsSinceEpoch - cacheTime;
+      if (cacheAge < 300000) { // 5 minutes
+        print('✅ Using cached app name (age: ${cacheAge / 1000}s)');
+        return json.decode(cachedAppName);
+      }
+    }
+    
     try {
       print('Getting app name with adminId: $adminId');
       
@@ -1097,21 +1172,46 @@ class ApiService {
         url += '?adminId=$adminId';
       }
       
-      final response = await http.get(Uri.parse(url));
+      final response = await _retryWithBackoff(() async {
+        return await http.get(
+          Uri.parse(url),
+          headers: {'Content-Type': 'application/json'},
+        );
+      }, maxRetries: 2, baseDelay: const Duration(milliseconds: 500));
       
       if (response.statusCode == 200) {
-        return json.decode(response.body);
+        final data = json.decode(response.body);
+        
+        // Cache the successful response
+        await prefs.setString('cached_app_name', json.encode(data));
+        await prefs.setInt('cached_app_name_time', DateTime.now().millisecondsSinceEpoch);
+        
+        return data;
       } else {
         throw Exception('Failed to get app name: ${response.statusCode}');
       }
     } catch (e) {
       print('Error getting app name: $e');
-      // Return fallback data
-      return {
-        'adminId': adminId ?? '',
-        'appName': 'MyApp',
-        'shopName': 'Default Shop'
+      
+      // Return cached data if available, even if expired
+      if (cachedAppName != null) {
+        print('⚠️  Using expired cached app name as fallback');
+        return json.decode(cachedAppName);
+      }
+      
+      // Return fallback data to prevent blank splash screen
+      final fallbackData = {
+        'success': true,
+        'appName': 'Appifyours',
+        'appLogo': null,
+        'message': 'Using fallback app name due to API error'
       };
+      
+      // Cache the fallback
+      await prefs.setString('cached_app_name', json.encode(fallbackData));
+      await prefs.setInt('cached_app_name_time', DateTime.now().millisecondsSinceEpoch);
+      
+      return fallbackData;
     }
   }
 
