@@ -75,16 +75,30 @@ class ShiprocketConfig {
 // ================================================================
 class ShiprocketService {
   String? _cachedToken;
+  bool _isFetchingToken = false; // Prevent duplicate login requests
 
   // ── GET / REFRESH TOKEN ──────────────────────────────────────
   Future<String?> getToken({bool forceRefresh = false}) async {
+    // Prevent multiple simultaneous login requests
+    if (_isFetchingToken && !forceRefresh) {
+      debugPrint('⏳ SR: Token fetch already in progress, waiting...');
+      // Wait for existing fetch to complete
+      while (_isFetchingToken) {
+        await Future.delayed(const Duration(milliseconds: 100));
+      }
+      return _cachedToken;
+    }
+
     if (ShiprocketConfig.email.isEmpty || ShiprocketConfig.password.isEmpty) {
       debugPrint(
           '❌ SR: Missing credentials. Build with --dart-define=SR_EMAIL=... --dart-define=SR_PASSWORD=...');
       return null;
     }
 
-    if (!forceRefresh && _cachedToken != null) return _cachedToken;
+    if (!forceRefresh && _cachedToken != null) {
+      debugPrint('✅ SR: Using in-memory cached token');
+      return _cachedToken;
+    }
 
     final prefs = await SharedPreferences.getInstance();
     final saved = prefs.getString(ShiprocketConfig._tokenKey);
@@ -93,82 +107,157 @@ class ShiprocketService {
 
     if (!forceRefresh && saved != null && now < expiry) {
       _cachedToken = saved;
-      debugPrint('✅ SR: Using cached token');
+      debugPrint('✅ SR: Using persisted cached token (expires in ${((expiry - now) / 1000 / 60 / 60).toStringAsFixed(1)} hours)');
       return saved;
     }
 
+    // Clear expired token
+    if (saved != null && now >= expiry) {
+      debugPrint('🗑️ SR: Clearing expired token');
+      await prefs.remove(ShiprocketConfig._tokenKey);
+      await prefs.remove(ShiprocketConfig._expiryKey);
+      _cachedToken = null;
+    }
+
+    _isFetchingToken = true;
     debugPrint('🔄 SR: Fetching new token...');
+    debugPrint('📧 SR: Email = ${ShiprocketConfig.email}');
+    debugPrint('🔑 SR: Password = ${ShiprocketConfig.password.substring(0, 3)}*** (length: ${ShiprocketConfig.password.length})');
+    
     try {
+      final loginBody = {
+        'email': ShiprocketConfig.email,
+        'password': ShiprocketConfig.password,
+      };
+      
+      debugPrint('📤 SR Login Request:');
+      debugPrint('  URL: ${ShiprocketConfig.baseUrl}/auth/login');
+      debugPrint('  Headers: {"Content-Type": "application/json"}');
+      debugPrint('  Body: ${json.encode({...loginBody, 'password': '***'})}');
+      
       final res = await http.post(
         Uri.parse('${ShiprocketConfig.baseUrl}/auth/login'),
         headers: {'Content-Type': 'application/json'},
-        body: json.encode({
-          'email': ShiprocketConfig.email,
-          'password': ShiprocketConfig.password,
-        }),
-      ).timeout(const Duration(seconds: 20));
+        body: json.encode(loginBody),
+      ).timeout(const Duration(seconds: 30));
 
-      debugPrint('SR Login → Status: ${res.statusCode}');
+      debugPrint('📥 SR Login Response:');
+      debugPrint('  Status: ${res.statusCode}');
+      debugPrint('  Body: ${res.body}');
 
       if (res.statusCode == 200) {
-        final data = json.decode(res.body);
-        final token = data['token']?.toString();
-        if (token != null && token.isNotEmpty) {
-          _cachedToken = token;
-          // Cache for 9 days (token valid 10 days)
-          final exp = now + const Duration(days: 9).inMilliseconds;
-          await prefs.setString(ShiprocketConfig._tokenKey, token);
-          await prefs.setInt(ShiprocketConfig._expiryKey, exp);
-          debugPrint('✅ SR: Token saved successfully');
-          return token;
-        } else {
-          debugPrint('❌ SR: Token missing in response');
+        try {
+          final data = json.decode(res.body);
+          
+          // Validate response structure
+          if (data is! Map) {
+            debugPrint('❌ SR: Invalid response format - expected Map, got ${data.runtimeType}');
+            return null;
+          }
+          
+          final token = data['token']?.toString();
+          if (token != null && token.isNotEmpty) {
+            _cachedToken = token;
+            // Cache for 9 days (token valid 10 days)
+            final exp = now + const Duration(days: 9).inMilliseconds;
+            await prefs.setString(ShiprocketConfig._tokenKey, token);
+            await prefs.setInt(ShiprocketConfig._expiryKey, exp);
+            debugPrint('✅ SR: Token saved successfully (expires at ${DateTime.fromMillisecondsSinceEpoch(exp).toIso8601String()}');
+            debugPrint('🔑 SR: Token length = ${token.length}');
+            return token;
+          } else {
+            debugPrint('❌ SR: Token missing in response');
+            debugPrint('❌ SR: Response keys: ${data.keys.join(', ')}');
+          }
+        } catch (e) {
+          debugPrint('❌ SR: Failed to parse login response: $e');
         }
       } else {
-        debugPrint('❌ SR Login failed: ${res.statusCode} → ${res.body}');
+        debugPrint('❌ SR Login failed: HTTP ${res.statusCode}');
+        debugPrint('❌ SR: Response body: ${res.body}');
+        
+        // Clear invalid credentials on 401
+        if (res.statusCode == 401) {
+          debugPrint('❌ SR: Invalid credentials - clearing token cache');
+          await prefs.remove(ShiprocketConfig._tokenKey);
+          await prefs.remove(ShiprocketConfig._expiryKey);
+          _cachedToken = null;
+        }
       }
+    } on http.ClientException catch (e) {
+      debugPrint('❌ SR Network error: $e');
+      debugPrint('❌ SR: This may be a CORS error if running on web. Shiprocket API does not support CORS from browser origins.');
     } catch (e) {
       debugPrint('❌ SR Login exception: $e');
+      debugPrint('❌ SR: Exception type: ${e.runtimeType}');
+    } finally {
+      _isFetchingToken = false;
     }
     return null;
   }
 
-  Map<String, String> _headers(String token) => {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer $token',
-      };
+  Map<String, String> _headers(String token) {
+    if (token.isEmpty) {
+      debugPrint('❌ SR: Cannot create headers - token is empty');
+      return {};
+    }
+    final headers = {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer $token',
+    };
+    debugPrint('📋 SR Headers: Authorization = Bearer ${token.substring(0, 10)}...');
+    return headers;
+  }
 
   // ── CHECK PINCODE ────────────────────────────────────────────
   Future<PincodeResult> checkPincode(String pincode) async {
+    debugPrint('📍 SR: Checking pincode: $pincode');
     String city = '', state = '';
 
     // India Post free API for city/state
     try {
+      debugPrint('📤 SR: Calling India Post API for pincode $pincode');
       final res = await http
           .get(Uri.parse('https://api.postalpincode.in/pincode/$pincode'))
-          .timeout(const Duration(seconds: 8));
+          .timeout(const Duration(seconds: 10));
 
+      debugPrint('📥 SR: India Post response status: ${res.statusCode}');
+      
       if (res.statusCode == 200) {
-        final d = json.decode(res.body);
-        if (d is List && d.isNotEmpty && d[0]['Status'] == 'Success') {
-          final po = (d[0]['PostOffice'] as List?)?.first;
-          city = po?['District']?.toString() ?? '';
-          state = po?['State']?.toString() ?? '';
-          debugPrint('✅ Pincode $pincode → $city, $state');
+        try {
+          final d = json.decode(res.body);
+          if (d is List && d.isNotEmpty && d[0] is Map && d[0]['Status'] == 'Success') {
+            final postOfficeList = d[0]['PostOffice'];
+            if (postOfficeList is List && postOfficeList.isNotEmpty) {
+              final po = postOfficeList.first;
+              if (po is Map) {
+                city = po['District']?.toString() ?? '';
+                state = po['State']?.toString() ?? '';
+                debugPrint('✅ SR: Pincode $pincode → $city, $state');
+              }
+            }
+          }
+        } catch (e) {
+          debugPrint('⚠️ SR: Failed to parse India Post response: $e');
         }
+      } else {
+        debugPrint('⚠️ SR: India Post API returned status ${res.statusCode}');
       }
+    } on http.ClientException catch (e) {
+      debugPrint('⚠️ SR: India Post network error: $e');
     } catch (e) {
-      debugPrint('India Post API error: $e');
+      debugPrint('⚠️ SR: India Post API error: $e');
     }
 
     // Shiprocket serviceability check
     final token = await getToken();
     if (token == null) {
+      debugPrint('⚠️ SR: No token available, skipping Shiprocket serviceability check');
       return PincodeResult(
         serviceable: city.isNotEmpty,
         city: city,
         state: state,
-        message: city.isEmpty ? 'Invalid pincode' : null,
+        message: city.isEmpty ? 'Invalid pincode' : 'Authentication failed - using basic pincode validation',
       );
     }
 
@@ -178,32 +267,72 @@ class ShiprocketService {
           '&delivery_postcode=$pincode'
           '&weight=0.5&cod=1';
 
-      final res = await http
-          .get(Uri.parse(url), headers: _headers(token))
-          .timeout(const Duration(seconds: 15));
-
-      debugPrint('SR Serviceability → ${res.statusCode}');
-
-      if (res.statusCode == 200) {
-        final d = json.decode(res.body);
-        final avail = d['data']?['available_courier_companies'];
-        final ok = avail is List && avail.isNotEmpty;
+      debugPrint('📤 SR: Checking Shiprocket serviceability');
+      debugPrint('  URL: $url');
+      
+      final headers = _headers(token);
+      if (headers.isEmpty) {
+        debugPrint('❌ SR: Cannot make request - headers are empty');
         return PincodeResult(
-          serviceable: ok,
+          serviceable: city.isNotEmpty,
           city: city,
           state: state,
-          message: ok ? null : 'Delivery not available at this pincode',
+          message: city.isEmpty ? 'Invalid pincode' : 'Authentication failed',
         );
-      } else if (res.statusCode == 401) {
-        // Token expired — refresh once and retry
-        final newToken = await getToken(forceRefresh: true);
-        if (newToken != null) return checkPincode(pincode);
       }
+
+      final res = await http
+          .get(Uri.parse(url), headers: headers)
+          .timeout(const Duration(seconds: 20));
+
+      debugPrint('📥 SR: Serviceability response status: ${res.statusCode}');
+      debugPrint('  Body: ${res.body}');
+
+      if (res.statusCode == 200) {
+        try {
+          final d = json.decode(res.body);
+          if (d is Map) {
+            final avail = d['data']?['available_courier_companies'];
+            final ok = avail is List && avail.isNotEmpty;
+            debugPrint('✅ SR: Serviceability check result: $ok');
+            return PincodeResult(
+              serviceable: ok,
+              city: city,
+              state: state,
+              message: ok ? null : 'Delivery not available at this pincode',
+            );
+          } else {
+            debugPrint('❌ SR: Invalid serviceability response format');
+          }
+        } catch (e) {
+          debugPrint('❌ SR: Failed to parse serviceability response: $e');
+        }
+      } else if (res.statusCode == 401) {
+        debugPrint('⚠️ SR: Token expired during serviceability check, refreshing...');
+        _cachedToken = null;
+        final newToken = await getToken(forceRefresh: true);
+        if (newToken != null) {
+          debugPrint('🔄 SR: Retrying serviceability check with new token');
+          return checkPincode(pincode);
+        }
+      } else {
+        debugPrint('❌ SR: Serviceability check failed with status ${res.statusCode}');
+      }
+    } on http.ClientException catch (e) {
+      debugPrint('❌ SR: Serviceability network error: $e');
+      debugPrint('❌ SR: This may be a CORS error if running on web');
     } catch (e) {
-      debugPrint('SR Serviceability error: $e');
+      debugPrint('❌ SR: Serviceability error: $e');
+      debugPrint('❌ SR: Exception type: ${e.runtimeType}');
     }
 
-    return PincodeResult(serviceable: city.isNotEmpty, city: city, state: state);
+    // Fallback to basic pincode validation
+    return PincodeResult(
+      serviceable: city.isNotEmpty,
+      city: city,
+      state: state,
+      message: city.isEmpty ? 'Invalid pincode' : 'Serviceability check failed, but pincode is valid',
+    );
   }
 
   // ── GET COURIER RATES ────────────────────────────────────────
@@ -211,8 +340,13 @@ class ShiprocketService {
     required String pincode,
     required double orderValue,
   }) async {
+    debugPrint('🚚 SR: Fetching courier rates for pincode: $pincode, order value: $orderValue');
+    
     final token = await getToken();
-    if (token == null) return _defaultCouriers();
+    if (token == null) {
+      debugPrint('⚠️ SR: No token available, returning default couriers');
+      return _defaultCouriers();
+    }
 
     try {
       final url = '${ShiprocketConfig.baseUrl}/courier/serviceability/'
@@ -221,42 +355,78 @@ class ShiprocketService {
           '&weight=0.5&cod=1'
           '&declared_value=${orderValue.toInt()}';
 
-      final res = await http
-          .get(Uri.parse(url), headers: _headers(token))
-          .timeout(const Duration(seconds: 15));
+      debugPrint('📤 SR: Fetching courier rates');
+      debugPrint('  URL: $url');
+      
+      final headers = _headers(token);
+      if (headers.isEmpty) {
+        debugPrint('❌ SR: Cannot make request - headers are empty');
+        return _defaultCouriers();
+      }
 
-      debugPrint('SR Couriers → ${res.statusCode}');
+      final res = await http
+          .get(Uri.parse(url), headers: headers)
+          .timeout(const Duration(seconds: 25));
+
+      debugPrint('📥 SR: Courier rates response status: ${res.statusCode}');
+      debugPrint('  Body: ${res.body}');
 
       if (res.statusCode == 200) {
-        final d = json.decode(res.body);
-        final companies = d['data']?['available_courier_companies'];
-        if (companies is List && companies.isNotEmpty) {
-          final list = companies.take(5).map((c) {
-            // FIX: parenthesize each cast separately — previously
-            // `c['freight_charge'] ?? c['rate'] as num? ?? 49` bound
-            // `as num?` only to c['rate'], which could throw if
-            // freight_charge existed but wasn't already a num.
-            final num rateNum =
-                (c['freight_charge'] as num?) ?? (c['rate'] as num?) ?? 49;
-            return CourierOption(
-              courierId: c['courier_company_id']?.toString() ?? '',
-              courierName: c['courier_name']?.toString() ?? 'Standard',
-              rate: rateNum.toDouble(),
-              estimatedDays: c['estimated_delivery_days']?.toString() ??
-                  c['etd']?.toString() ??
-                  '3-5',
-              codAvailable: c['cod'] == 1 || c['cod'] == true,
-            );
-          }).toList();
-          list.sort((a, b) => a.rate.compareTo(b.rate));
-          return list;
+        try {
+          final d = json.decode(res.body);
+          if (d is Map) {
+            final companies = d['data']?['available_courier_companies'];
+            if (companies is List && companies.isNotEmpty) {
+              debugPrint('✅ SR: Found ${companies.length} courier options');
+              final list = companies.take(5).map((c) {
+                // FIX: parenthesize each cast separately — previously
+                // `c['freight_charge'] ?? c['rate'] as num? ?? 49` bound
+                // `as num?` only to c['rate'], which could throw if
+                // freight_charge existed but wasn't already a num.
+                final num rateNum =
+                    (c['freight_charge'] as num?) ?? (c['rate'] as num?) ?? 49;
+                return CourierOption(
+                  courierId: c['courier_company_id']?.toString() ?? '',
+                  courierName: c['courier_name']?.toString() ?? 'Standard',
+                  rate: rateNum.toDouble(),
+                  estimatedDays: c['estimated_delivery_days']?.toString() ??
+                      c['etd']?.toString() ??
+                      '3-5',
+                  codAvailable: c['cod'] == 1 || c['cod'] == true,
+                );
+              }).toList();
+              list.sort((a, b) => a.rate.compareTo(b.rate));
+              debugPrint('✅ SR: Returning ${list.length} sorted courier options');
+              return list;
+            } else {
+              debugPrint('⚠️ SR: No courier companies available in response');
+            }
+          } else {
+            debugPrint('❌ SR: Invalid courier rates response format');
+          }
+        } catch (e) {
+          debugPrint('❌ SR: Failed to parse courier rates response: $e');
         }
       } else if (res.statusCode == 401) {
-        await getToken(forceRefresh: true);
+        debugPrint('⚠️ SR: Token expired during courier rates fetch, refreshing...');
+        _cachedToken = null;
+        final newToken = await getToken(forceRefresh: true);
+        if (newToken != null) {
+          debugPrint('🔄 SR: Retrying courier rates fetch with new token');
+          return getCourierRates(pincode: pincode, orderValue: orderValue);
+        }
+      } else {
+        debugPrint('❌ SR: Courier rates fetch failed with status ${res.statusCode}');
       }
+    } on http.ClientException catch (e) {
+      debugPrint('❌ SR: Courier rates network error: $e');
+      debugPrint('❌ SR: This may be a CORS error if running on web');
     } catch (e) {
-      debugPrint('SR Courier rates error: $e');
+      debugPrint('❌ SR: Courier rates error: $e');
+      debugPrint('❌ SR: Exception type: ${e.runtimeType}');
     }
+    
+    debugPrint('⚠️ SR: Returning default couriers as fallback');
     return _defaultCouriers();
   }
 
@@ -275,8 +445,11 @@ class ShiprocketService {
     required String timeSlot,
     required String paymentMethod,
   }) async {
+    debugPrint('📦 SR: Placing order for ${address.fullName} at ${address.pincode}');
+    
     final token = await getToken();
     if (token == null) {
+      debugPrint('❌ SR: No token available for order placement');
       return OrderResult(
         success: false,
         orderId: '',
@@ -289,24 +462,48 @@ class ShiprocketService {
     final dateStr = '${now.year}-${_pad(now.month)}-${_pad(now.day)} '
         '${_pad(now.hour)}:${_pad(now.minute)}';
 
+    debugPrint('📦 SR: Order ID: $localId');
+    debugPrint('📦 SR: Order Date: $dateStr');
+    debugPrint('📦 SR: Pickup Location: ${ShiprocketConfig.pickupLocation}');
+    debugPrint('📦 SR: Items count: ${items.length}');
+    debugPrint('📦 SR: Total amount: $totalAmount');
+    debugPrint('📦 SR: Payment method: $paymentMethod');
+
     // FIX: use the real loop index instead of items.indexOf(i), which
     // returns the FIRST matching index and breaks (gives duplicate
     // SKUs) when two cart items happen to be == to each other.
     final orderItems = <Map<String, dynamic>>[];
     for (var idx = 0; idx < items.length; idx++) {
       final i = items[idx];
+      if (i == null) {
+        debugPrint('⚠️ SR: Skipping null item at index $idx');
+        continue;
+      }
       final price = (i['price'] as num?)?.toDouble() ?? 0.0;
       final qty = (i['quantity'] as num?)?.toInt() ?? 1;
+      final itemName = i['name']?.toString() ?? 'Product';
+      final sku = (i['id']?.toString() ?? 'SKU${idx + 1}')
+          .replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+      
       orderItems.add({
-        'name': i['name']?.toString() ?? 'Product',
-        'sku': (i['id']?.toString() ?? 'SKU${idx + 1}')
-            .replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_'),
+        'name': itemName,
+        'sku': sku,
         'units': qty,
         'selling_price': price.toStringAsFixed(2),
         'discount': '',
         'tax': '',
         'hsn': '',
       });
+      debugPrint('  📦 SR: Item $idx: $itemName (SKU: $sku, Qty: $qty, Price: $price)');
+    }
+
+    if (orderItems.isEmpty) {
+      debugPrint('❌ SR: No valid items in order');
+      return OrderResult(
+        success: false,
+        orderId: localId,
+        message: 'No valid items in order',
+      );
     }
 
     final body = {
@@ -334,57 +531,91 @@ class ShiprocketService {
       'weight': 0.5,
     };
 
-    debugPrint('=== SR PLACE ORDER REQUEST ===');
-    debugPrint('URL: ${ShiprocketConfig.baseUrl}/orders/create/adhoc');
+    debugPrint('📤 SR: Creating order request');
+    debugPrint('  URL: ${ShiprocketConfig.baseUrl}/orders/create/adhoc');
+    debugPrint('  Pickup Location: ${ShiprocketConfig.pickupLocation}');
+    
+    final headers = _headers(token);
+    if (headers.isEmpty) {
+      debugPrint('❌ SR: Cannot make request - headers are empty');
+      return OrderResult(
+        success: false,
+        orderId: localId,
+        message: 'Authentication failed - invalid headers',
+      );
+    }
 
     try {
       final res = await http.post(
         Uri.parse('${ShiprocketConfig.baseUrl}/orders/create/adhoc'),
-        headers: _headers(token),
+        headers: headers,
         body: json.encode(body),
-      ).timeout(const Duration(seconds: 30));
+      ).timeout(const Duration(seconds: 45));
 
-      debugPrint('=== SR PLACE ORDER RESPONSE ===');
-      debugPrint('Status: ${res.statusCode}');
-      debugPrint('Body:   ${res.body}');
+      debugPrint('📥 SR: Order creation response');
+      debugPrint('  Status: ${res.statusCode}');
+      debugPrint('  Body: ${res.body}');
 
       if (res.statusCode == 200 || res.statusCode == 201) {
-        final d = json.decode(res.body);
-
-        if (d['status'] == 1 || d['order_id'] != null || d['payload']?['order_id'] != null) {
-          final orderId = (d['order_id'] ?? d['payload']?['order_id'] ?? localId).toString();
-          final shipId = (d['shipment_id'] ?? d['payload']?['shipment_id'] ?? '').toString();
-
-          debugPrint('✅ SR Order created! order_id=$orderId shipment_id=$shipId');
-
-          // FIX: AWB code is NOT returned by orders/create/adhoc.
-          // It only exists after a separate AWB-assignment call.
-          // We attempt that here so tracking actually works; if it
-          // fails, the order itself still succeeded, so we don't
-          // fail the whole checkout — we just leave awbCode blank
-          // and the "Track My Order" button stays hidden as before.
-          String awb = '';
-          if (shipId.isNotEmpty) {
-            awb = await _assignAwb(token: token, shipmentId: shipId);
+        try {
+          final d = json.decode(res.body);
+          
+          if (d is! Map) {
+            debugPrint('❌ SR: Invalid order response format - expected Map, got ${d.runtimeType}');
+            return OrderResult(
+              success: false,
+              orderId: localId,
+              message: 'Invalid response format from Shiprocket',
+            );
           }
 
+          if (d['status'] == 1 || d['order_id'] != null || d['payload']?['order_id'] != null) {
+            final orderId = (d['order_id'] ?? d['payload']?['order_id'] ?? localId).toString();
+            final shipId = (d['shipment_id'] ?? d['payload']?['shipment_id'] ?? '').toString();
+
+            debugPrint('✅ SR: Order created successfully!');
+            debugPrint('  Order ID: $orderId');
+            debugPrint('  Shipment ID: $shipId');
+
+            // FIX: AWB code is NOT returned by orders/create/adhoc.
+            // It only exists after a separate AWB-assignment call.
+            // We attempt that here so tracking actually works; if it
+            // fails, the order itself still succeeded, so we don't
+            // fail the whole checkout — we just leave awbCode blank
+            // and the "Track My Order" button stays hidden as before.
+            String awb = '';
+            if (shipId.isNotEmpty) {
+              debugPrint('🔄 SR: Attempting to assign AWB...');
+              awb = await _assignAwb(token: token, shipmentId: shipId);
+            }
+
+            return OrderResult(
+              success: true,
+              orderId: orderId,
+              shipmentId: shipId,
+              awbCode: awb,
+              message: 'Order placed on Shiprocket ✅',
+            );
+          } else {
+            final errMsg = d['message']?.toString() ?? d['error']?.toString() ?? 'Unknown error from Shiprocket';
+            debugPrint('❌ SR: Order error in response body: $errMsg');
+            debugPrint('❌ SR: Response keys: ${d.keys.join(', ')}');
+            return OrderResult(success: false, orderId: localId, message: errMsg);
+          }
+        } catch (e) {
+          debugPrint('❌ SR: Failed to parse order response: $e');
           return OrderResult(
-            success: true,
-            orderId: orderId,
-            shipmentId: shipId,
-            awbCode: awb,
-            message: 'Order placed on Shiprocket ✅',
+            success: false,
+            orderId: localId,
+            message: 'Failed to parse Shiprocket response: ${e.toString()}',
           );
-        } else {
-          final errMsg = d['message']?.toString() ?? d['error']?.toString() ?? 'Unknown error from Shiprocket';
-          debugPrint('❌ SR Order error in body: $errMsg');
-          return OrderResult(success: false, orderId: localId, message: errMsg);
         }
       } else if (res.statusCode == 401) {
-        debugPrint('⚠️ SR 401 — refreshing token and retrying...');
+        debugPrint('⚠️ SR: Token expired during order creation, refreshing...');
         _cachedToken = null;
         final newToken = await getToken(forceRefresh: true);
         if (newToken != null) {
+          debugPrint('🔄 SR: Retrying order creation with new token');
           return placeOrder(
             address: address,
             items: items,
@@ -394,18 +625,33 @@ class ShiprocketService {
             paymentMethod: paymentMethod,
           );
         }
-        return OrderResult(success: false, orderId: localId, message: 'Auth token expired. Please try again.');
+        return OrderResult(
+          success: false,
+          orderId: localId,
+          message: 'Auth token expired. Please try again.',
+        );
       } else {
         String errMsg = 'Order failed (HTTP ${res.statusCode})';
         try {
           final d = json.decode(res.body);
-          errMsg = d['message']?.toString() ?? d['error']?.toString() ?? errMsg;
+          if (d is Map) {
+            errMsg = d['message']?.toString() ?? d['error']?.toString() ?? errMsg;
+          }
         } catch (_) {}
-        debugPrint('❌ SR Order failed: $errMsg');
+        debugPrint('❌ SR: Order creation failed: $errMsg');
         return OrderResult(success: false, orderId: localId, message: errMsg);
       }
+    } on http.ClientException catch (e) {
+      debugPrint('❌ SR: Order creation network error: $e');
+      debugPrint('❌ SR: This may be a CORS error if running on web. Shiprocket API does not support CORS from browser origins.');
+      return OrderResult(
+        success: false,
+        orderId: localId,
+        message: 'Network error: Unable to connect to Shiprocket. This may be a CORS issue on web.',
+      );
     } catch (e) {
-      debugPrint('❌ SR Place order exception: $e');
+      debugPrint('❌ SR: Order creation exception: $e');
+      debugPrint('❌ SR: Exception type: ${e.runtimeType}');
       return OrderResult(
         success: false,
         orderId: localId,
@@ -419,70 +665,163 @@ class ShiprocketService {
   // courier assignment for a shipment. Without this call, AWB is
   // always blank and the "Track My Order" button never shows up.
   Future<String> _assignAwb({required String token, required String shipmentId}) async {
+    debugPrint('🔄 SR: Assigning AWB for shipment: $shipmentId');
+    
     try {
+      final headers = _headers(token);
+      if (headers.isEmpty) {
+        debugPrint('❌ SR: Cannot assign AWB - headers are empty');
+        return '';
+      }
+
       final res = await http.post(
         Uri.parse('${ShiprocketConfig.baseUrl}/courier/assign/awb'),
-        headers: _headers(token),
+        headers: headers,
         body: json.encode({'shipment_id': shipmentId}),
-      ).timeout(const Duration(seconds: 20));
+      ).timeout(const Duration(seconds: 30));
 
-      debugPrint('SR Assign AWB → ${res.statusCode}: ${res.body}');
+      debugPrint('📥 SR: AWB assignment response');
+      debugPrint('  Status: ${res.statusCode}');
+      debugPrint('  Body: ${res.body}');
 
       if (res.statusCode == 200) {
-        final d = json.decode(res.body);
-        final awb = d['response']?['data']?['awb_code']?.toString() ?? '';
-        if (awb.isNotEmpty) {
-          debugPrint('✅ SR AWB assigned: $awb');
-          return awb;
+        try {
+          final d = json.decode(res.body);
+          if (d is Map) {
+            final awb = d['response']?['data']?['awb_code']?.toString() ?? '';
+            if (awb.isNotEmpty) {
+              debugPrint('✅ SR: AWB assigned successfully: $awb');
+              return awb;
+            } else {
+              debugPrint('⚠️ SR: AWB code not found in response');
+              debugPrint('⚠️ SR: Response keys: ${d.keys.join(', ')}');
+            }
+          } else {
+            debugPrint('❌ SR: Invalid AWB response format - expected Map, got ${d.runtimeType}');
+          }
+        } catch (e) {
+          debugPrint('❌ SR: Failed to parse AWB response: $e');
         }
+      } else if (res.statusCode == 401) {
+        debugPrint('⚠️ SR: Token expired during AWB assignment, refreshing...');
+        _cachedToken = null;
+        final newToken = await getToken(forceRefresh: true);
+        if (newToken != null) {
+          debugPrint('🔄 SR: Retrying AWB assignment with new token');
+          return _assignAwb(token: newToken, shipmentId: shipmentId);
+        }
+      } else {
+        debugPrint('❌ SR: AWB assignment failed with status ${res.statusCode}');
       }
+    } on http.ClientException catch (e) {
+      debugPrint('❌ SR: AWB assignment network error: $e');
+      debugPrint('❌ SR: This may be a CORS error if running on web');
     } catch (e) {
-      debugPrint('SR Assign AWB error: $e');
+      debugPrint('❌ SR: AWB assignment error: $e');
+      debugPrint('❌ SR: Exception type: ${e.runtimeType}');
     }
     // Non-fatal: order already succeeded, tracking just won't be
     // available immediately. Some accounts auto-assign couriers
     // shortly after order creation — user can pull-to-refresh later.
+    debugPrint('⚠️ SR: AWB assignment failed, but order was successful');
     return '';
   }
 
   // ── TRACK ORDER ──────────────────────────────────────────────
   Future<TrackingResult> trackOrder(String awbCode) async {
-    if (awbCode.isEmpty) return _demoTracking();
+    debugPrint('📍 SR: Tracking order for AWB: $awbCode');
+    
+    if (awbCode.isEmpty) {
+      debugPrint('⚠️ SR: No AWB code provided, returning demo tracking');
+      return _demoTracking();
+    }
 
     final token = await getToken();
-    if (token == null) return _demoTracking();
+    if (token == null) {
+      debugPrint('⚠️ SR: No token available for tracking, returning demo tracking');
+      return _demoTracking();
+    }
 
     try {
+      final headers = _headers(token);
+      if (headers.isEmpty) {
+        debugPrint('❌ SR: Cannot track order - headers are empty');
+        return _demoTracking();
+      }
+
+      debugPrint('📤 SR: Fetching tracking data');
+      debugPrint('  URL: ${ShiprocketConfig.baseUrl}/courier/track/awb/$awbCode');
+      
       final res = await http.get(
         Uri.parse('${ShiprocketConfig.baseUrl}/courier/track/awb/$awbCode'),
-        headers: _headers(token),
-      ).timeout(const Duration(seconds: 15));
+        headers: headers,
+      ).timeout(const Duration(seconds: 25));
 
-      debugPrint('SR Track → ${res.statusCode}');
+      debugPrint('📥 SR: Tracking response');
+      debugPrint('  Status: ${res.statusCode}');
+      debugPrint('  Body: ${res.body}');
 
       if (res.statusCode == 200) {
-        final d = json.decode(res.body);
-        final tracking = d['tracking_data'];
-        final ship = (tracking?['shipment_track'] as List?)?.first ?? {};
-        final acts = tracking?['shipment_track_activities'] as List? ?? [];
+        try {
+          final d = json.decode(res.body);
+          if (d is Map) {
+            final tracking = d['tracking_data'];
+            if (tracking is Map) {
+              final shipmentTrack = tracking['shipment_track'];
+              final ship = (shipmentTrack is List && shipmentTrack.isNotEmpty) ? shipmentTrack.first : {};
+              final acts = tracking['shipment_track_activities'] as List? ?? [];
 
-        return TrackingResult(
-          status: ship['current_status']?.toString() ?? 'Processing',
-          currentLocation: ship['delivered_to']?.toString() ?? '',
-          estimatedDate: ship['etd']?.toString() ?? '',
-          events: acts
-              .map<TrackEvent>((a) => TrackEvent(
-                    status: a['activity']?.toString() ?? '',
-                    location: a['location']?.toString() ?? '',
-                    time: a['date']?.toString() ?? '',
-                    done: true,
-                  ))
-              .toList(),
-        );
+              debugPrint('✅ SR: Tracking data retrieved successfully');
+              debugPrint('  Status: ${ship['current_status']}');
+              debugPrint('  Activities: ${acts.length}');
+
+              return TrackingResult(
+                status: ship['current_status']?.toString() ?? 'Processing',
+                currentLocation: ship['delivered_to']?.toString() ?? '',
+                estimatedDate: ship['etd']?.toString() ?? '',
+                events: acts
+                    .map<TrackEvent>((a) {
+                      if (a is Map) {
+                        return TrackEvent(
+                          status: a['activity']?.toString() ?? '',
+                          location: a['location']?.toString() ?? '',
+                          time: a['date']?.toString() ?? '',
+                          done: true,
+                        );
+                      }
+                      return TrackEvent(status: '', location: '', time: '', done: false);
+                    })
+                    .toList(),
+              );
+            } else {
+              debugPrint('❌ SR: Invalid tracking_data format - expected Map');
+            }
+          } else {
+            debugPrint('❌ SR: Invalid tracking response format - expected Map');
+          }
+        } catch (e) {
+          debugPrint('❌ SR: Failed to parse tracking response: $e');
+        }
+      } else if (res.statusCode == 401) {
+        debugPrint('⚠️ SR: Token expired during tracking, refreshing...');
+        _cachedToken = null;
+        final newToken = await getToken(forceRefresh: true);
+        if (newToken != null) {
+          debugPrint('🔄 SR: Retrying tracking with new token');
+          return trackOrder(awbCode);
+        }
+      } else {
+        debugPrint('❌ SR: Tracking failed with status ${res.statusCode}');
       }
+    } on http.ClientException catch (e) {
+      debugPrint('❌ SR: Tracking network error: $e');
+      debugPrint('❌ SR: This may be a CORS error if running on web');
     } catch (e) {
-      debugPrint('SR Track error: $e');
+      debugPrint('❌ SR: Tracking error: $e');
+      debugPrint('❌ SR: Exception type: ${e.runtimeType}');
     }
+    
+    debugPrint('⚠️ SR: Returning demo tracking as fallback');
     return _demoTracking();
   }
 
