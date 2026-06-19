@@ -5733,7 +5733,7 @@ Future<void> loadDynamicProductData() async {
 
 
 
-      Uri.parse('${dotenv.env['API_BASE'] ?? 'http://localhost:5000'}/api/get-form?adminId=${adminId}&appId=${ApiConfig.appId}'),
+      Uri.parse('${dotenv.env['API_BASE'] ?? (throw Exception('API_BASE environment variable is not set. Please configure it in your .env file.'))}/api/get-form?adminId=${adminId}&appId=${ApiConfig.appId}'),
 
 
 
@@ -6533,7 +6533,7 @@ void startRealTimeUpdates() async {
 
 
 
-    _appSync.connect(adminId: adminId, apiBase: dotenv.env['API_BASE'] ?? 'http://localhost:5000');
+    _appSync.connect(adminId: adminId, apiBase: dotenv.env['API_BASE'] ?? (throw Exception('API_BASE environment variable is not set. Please configure it in your .env file.')));
 
 
 
@@ -7830,7 +7830,7 @@ class ApiConfig {
 
 
 
-  static String get baseUrl => dotenv.env['API_BASE'] ?? 'http://localhost:5000';
+  static String get baseUrl => dotenv.env['API_BASE'] ?? (throw Exception('API_BASE environment variable is not set. Please configure it in your .env file.'));
 
 
 
@@ -9606,7 +9606,7 @@ class _SplashScreenState extends State<SplashScreen> {
 
 
 
-        Uri.parse('${dotenv.env['API_BASE'] ?? 'http://localhost:5000'}/api/admin/splash?adminId=${adminId}&appId=${ApiConfig.appId}'),
+        Uri.parse('${dotenv.env['API_BASE'] ?? ApiService().baseUrl}/api/admin/splash?adminId=${adminId}&appId=${ApiConfig.appId}'),
 
 
 
@@ -15126,7 +15126,7 @@ class _CreateAccountPageState extends State<CreateAccountPage> {
 
 
 
-        Uri.parse('${dotenv.env['API_BASE'] ?? 'http://localhost:5000'}/api/signup'),
+        Uri.parse('${dotenv.env['API_BASE'] ?? (throw Exception('API_BASE environment variable is not set. Please configure it in your .env file.'))}/api/signup'),
 
 
 
@@ -18797,7 +18797,7 @@ class _HomePageState extends State<HomePage> {
 
 
 
-        Uri.parse('${dotenv.env['API_BASE'] ?? 'http://localhost:5000'}/api/get-form?adminId=${adminId}&appId=${ApiConfig.appId}'),
+        Uri.parse('${dotenv.env['API_BASE'] ?? (throw Exception('API_BASE environment variable is not set. Please configure it in your .env file.'))}/api/get-form?adminId=${adminId}&appId=${ApiConfig.appId}'),
 
 
 
@@ -32629,7 +32629,7 @@ class _HomePageState extends State<HomePage> {
 
 
 
-        Uri.parse('${dotenv.env['API_BASE'] ?? 'http://localhost:5000'}/api/get-form?adminId=${adminId}&appId=${ApiConfig.appId}'),
+        Uri.parse('${dotenv.env['API_BASE'] ?? (throw Exception('API_BASE environment variable is not set. Please configure it in your .env file.'))}/api/get-form?adminId=${adminId}&appId=${ApiConfig.appId}'),
 
 
 
@@ -34021,7 +34021,7 @@ class _HomePageState extends State<HomePage> {
 
 
 
-        Uri.parse('${dotenv.env['API_BASE'] ?? 'http://localhost:5000'}/api/get-form?adminId=${adminId}&appId=${ApiConfig.appId}'),
+        Uri.parse('${dotenv.env['API_BASE'] ?? (throw Exception('API_BASE environment variable is not set. Please configure it in your .env file.'))}/api/get-form?adminId=${adminId}&appId=${ApiConfig.appId}'),
 
 
 
