@@ -236,6 +236,7 @@ class ShiprocketService {
         },
         'timeSlot': timeSlot,
         'paymentMethod': paymentMethod,
+        'shopName': 'Appifyours',
       });
       
       if (result['success'] == true) {
