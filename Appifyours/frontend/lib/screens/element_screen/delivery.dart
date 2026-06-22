@@ -11,10 +11,6 @@
 //   - POST /api/shiprocket/create-order
 //   - GET /api/shiprocket/track/:awbCode
 //
-// pubspec.yaml needs:
-//   http: ^1.0.0
-//   shared_preferences: ^2.0.0
-//
 // ================================================================
 
 import 'package:flutter/material.dart';
@@ -22,7 +18,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:convert';
 import 'dart:io';
-import 'package:frontend/services/api_service.dart';
+import 'package:appifyours/services/api_service.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 // ================================================================
@@ -50,6 +46,24 @@ class ShiprocketConfig {
 class ShiprocketService {
   final ApiService _apiService = ApiService();
 
+  // Helper to get token from ApiService
+  Future<String?> _getToken() async {
+    // Use the public method if available, or access directly
+    try {
+      // Try to use a public method first
+      return await _apiService.getToken();
+    } catch (e) {
+      // Fallback: directly access shared preferences
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        return prefs.getString('auth_token');
+      } catch (e2) {
+        print('Error getting token: $e2');
+        return null;
+      }
+    }
+  }
+
   // Helper to make authenticated requests to backend proxy
   Future<Map<String, dynamic>> _proxyRequest(
     String method,
@@ -57,7 +71,7 @@ class ShiprocketService {
     Map<String, dynamic>? body,
   ) async {
     try {
-      final token = await _apiService._getToken();
+      final token = await _getToken();
       if (token == null) {
         throw Exception('No authentication token found');
       }
@@ -66,9 +80,7 @@ class ShiprocketService {
       debugPrint('📤 SR Proxy: $method $url');
 
       late http.Response response;
-      final timeout = Platform.isAndroid || Platform.isIOS 
-          ? const Duration(seconds: 60) 
-          : const Duration(seconds: 30);
+      final timeout = const Duration(seconds: 30);
           
       if (method == 'POST') {
         response = await http.post(
@@ -95,14 +107,37 @@ class ShiprocketService {
       
       final data = json.decode(response.body);
       if (response.statusCode >= 200 && response.statusCode < 300) {
-        return data;
+        return _convertResponseToStrings(data);
       } else {
-        throw Exception(data['error'] ?? 'Request failed');
+        throw Exception(data['error']?.toString() ?? 'Request failed');
       }
     } catch (e) {
       debugPrint('❌ SR Proxy error: $e');
       rethrow;
     }
+  }
+
+  Map<String, dynamic> _convertResponseToStrings(Map<String, dynamic> data) {
+    final converted = <String, dynamic>{};
+    data.forEach((key, value) {
+      if (value is int || value is double) {
+        converted[key] = value.toString();
+      } else if (value is Map) {
+        converted[key] = _convertResponseToStrings(value as Map<String, dynamic>);
+      } else if (value is List) {
+        converted[key] = value.map((item) {
+          if (item is Map) {
+            return _convertResponseToStrings(item as Map<String, dynamic>);
+          } else if (item is int || item is double) {
+            return item.toString();
+          }
+          return item;
+        }).toList();
+      } else {
+        converted[key] = value;
+      }
+    });
+    return converted;
   }
 
   // ── CHECK PINCODE ────────────────────────────────────────────
@@ -120,7 +155,6 @@ class ShiprocketService {
       );
     } catch (e) {
       debugPrint('❌ SR: Pincode check failed: $e');
-      // Fallback to basic validation
       return PincodeResult(
         serviceable: false,
         city: '',
@@ -188,16 +222,16 @@ class ShiprocketService {
         debugPrint('⚠️ SR: Skipping null item at index $idx');
         continue;
       }
-      final price = (i['price'] as num?)?.toDouble() ?? 0.0;
-      final qty = (i['quantity'] as num?)?.toInt() ?? 1;
-      final itemName = i['name']?.toString() ?? 'Product';
-      final sku = (i['id']?.toString() ?? 'SKU${idx + 1}')
-          .replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+      final price = (i['price'] is num ? (i['price'] as num).toDouble() : 0.0);
+      final qty = (i['quantity'] is num ? (i['quantity'] as num).toInt() : 1);
+      final itemName = (i['name']?.toString() ?? 'Product');
+      final itemId = (i['id']?.toString() ?? 'SKU${idx + 1}');
+      final sku = itemId.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
       
       orderItems.add({
         'name': itemName,
         'sku': sku,
-        'units': qty,
+        'units': qty.toString(),
         'selling_price': price.toStringAsFixed(2),
         'discount': '',
         'tax': '',
@@ -232,7 +266,7 @@ class ShiprocketService {
         'courier': {
           'courierId': courier.courierId,
           'courierName': courier.courierName,
-          'rate': courier.rate,
+          'rate': courier.rate.toString(),
         },
         'timeSlot': timeSlot,
         'paymentMethod': paymentMethod,
@@ -241,15 +275,16 @@ class ShiprocketService {
       
       if (result['success'] == true) {
         debugPrint('✅ SR: Order created successfully via backend proxy');
+        
         return OrderResult(
           success: true,
-          orderId: result['orderId'] ?? localId,
-          shipmentId: result['shipmentId'] ?? '',
-          awbCode: result['awbCode'] ?? '',
-          message: result['message'] ?? 'Order placed on Shiprocket ✅',
+          orderId: result['orderId']?.toString() ?? localId,
+          shipmentId: result['shipmentId']?.toString() ?? '',
+          awbCode: result['awbCode']?.toString() ?? '',
+          message: result['message']?.toString() ?? 'Order placed on Shiprocket ✅',
         );
       } else {
-        throw Exception(result['error'] ?? 'Order creation failed');
+        throw Exception(result['error']?.toString() ?? 'Order creation failed');
       }
     } catch (e) {
       debugPrint('❌ SR: Order creation failed: $e');
@@ -260,10 +295,6 @@ class ShiprocketService {
       );
     }
   }
-
-  // ── ASSIGN AWB (No longer needed - handled by backend) ──
-  // The backend proxy handles AWB assignment automatically
-  // during order creation.
 
   // ── TRACK ORDER ──────────────────────────────────────────────
   Future<TrackingResult> trackOrder(String awbCode) async {
@@ -295,7 +326,6 @@ class ShiprocketService {
       debugPrint('❌ SR: Tracking failed: $e');
     }
 
-    // Fallback to demo tracking
     return _demoTracking();
   }
 
@@ -597,10 +627,10 @@ class _DCPState extends State<DeliveryCheckoutPage> {
 
     final orderItems = _items
         .map((i) => {
-              'id': i.id,
-              'name': i.name,
-              'price': i.effectivePrice,
-              'quantity': i.quantity,
+              'id': (i.id is int ? i.id.toString() : i.id?.toString() ?? ''),
+              'name': (i.name is String ? i.name : i.name?.toString() ?? ''),
+              'price': (i.effectivePrice is num ? (i.effectivePrice as num).toDouble() : 0.0),
+              'quantity': (i.quantity is num ? (i.quantity as num).toInt() : 1),
             })
         .toList();
 
