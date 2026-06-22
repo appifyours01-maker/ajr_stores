@@ -67,31 +67,34 @@ class ApiService {
     return raw;
   }
 
-  // Platform-specific timeout configuration
+  // Platform-specific timeout configuration (increased for slow networks)
   Duration get _defaultTimeout {
     if (kIsWeb) {
-      return const Duration(seconds: 30); // Web: faster, more reliable
+      return const Duration(seconds: 120); // Web: increased for slow connections
     } else if (Platform.isAndroid) {
-      return const Duration(seconds: 45); // Android: mobile networks can be slower
+      return const Duration(seconds: 180); // Android: mobile networks can be very slow
     } else if (Platform.isIOS) {
-      return const Duration(seconds: 45); // iOS: mobile networks can be slower
+      return const Duration(seconds: 180); // iOS: mobile networks can be very slow
     } else {
-      return const Duration(seconds: 30); // Default
+      return const Duration(seconds: 120); // Default
     }
   }
 
   // Retry logic with exponential backoff
   Future<http.Response> _retryWithBackoff(
     Future<http.Response> Function() requestFn, {
-    int maxRetries = 3,
+    int maxRetries = 5, // Increased retries for slow networks
     Duration? baseDelay,
   }) async {
-    final delay = baseDelay ?? const Duration(milliseconds: 1000);
+    final delay = baseDelay ?? const Duration(milliseconds: 2000); // Increased base delay
     
     for (int attempt = 0; attempt < maxRetries; attempt++) {
       try {
+        print('🔄 API Request attempt ${attempt + 1}/$maxRetries to $baseUrl');
         return await requestFn().timeout(_defaultTimeout);
       } catch (e) {
+        print('❌ API Request failed (attempt ${attempt + 1}/$maxRetries): $e');
+        
         // Don't retry on client errors (4xx)
         if (e is http.ClientException && e.toString().contains('401')) {
           rethrow;
@@ -99,6 +102,7 @@ class ApiService {
         
         // Don't retry on the last attempt
         if (attempt == maxRetries - 1) {
+          print('💥 Max retries exceeded for $baseUrl');
           rethrow;
         }
         
@@ -107,7 +111,7 @@ class ApiService {
           milliseconds: delay.inMilliseconds * (1 << attempt),
         );
         
-        print('⚠️  Retry attempt ${attempt + 1}/$maxRetries after ${backoffDelay.inSeconds}s');
+        print('⏳ Retrying after ${backoffDelay.inSeconds}s...');
         await Future.delayed(backoffDelay);
       }
     }
